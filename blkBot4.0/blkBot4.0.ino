@@ -1,0 +1,852 @@
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include "DualVNH5019MotorShield.h"
+#include <SharpIR.h>
+#include <Servo.h>
+#include <QTRSensors.h>
+
+DualVNH5019MotorShield md;
+
+
+
+
+
+/////////////////////////////////////////////////////////////////////IR
+#define IRL A2
+#define IRR A3
+#define IRF A4
+#define IRDigi 22
+
+
+#define model 1080
+SharpIR sharpl(IRL, 25, 93, model);
+SharpIR sharpr(IRR, 25, 93, model);
+SharpIR sharpf(IRF, 25, 93, model);
+int disL = 0;
+int disR = 0;
+int disF = 0;
+int digiOut = 0;
+
+int object = 0; /// to find an object infront
+//*********************************************************************//
+
+
+
+
+
+//////////////////////////////////////////////////////////////indicators
+
+#define blackLed 24 //green led
+#define whiteLed 26 //yellow led
+#define optionalLed 28 // red led
+//*********************************************************************//
+
+
+
+/////////////////////////////////////////////////////////PID
+float Kp = 6;
+float Ki = 0.02;
+float Kd = 55;
+float pTerm, iTerm, dTerm, integrated_error, last_error;
+#define   GUARD_GAIN   10.0
+float error = 0;
+const float K = 1;//1.9
+int speed = 0;
+
+
+
+
+int speedEncoder = 0;
+float last_errorEncoder = 0;
+float errorEncoder = 0;
+
+float last_errorR = 0;
+float last_errorL = 0;
+
+//*********************************************************************//
+
+
+///////////////////////////////////////////////////////////////SensorArray
+#define NUM_SENSORS   8     // number of sensors used
+#define TIMEOUT       2500  // waits for 2500 microseconds for sensor outputs to go low
+#define EMITTER_PIN   2     // emitter is controlled by digital pin 2
+int sensorSum = 0;
+
+// sensors 0 through 7 are connected to digital pins 3 through 10, respectively
+QTRSensorsRC qtrrc((unsigned char[]) {
+  23, 25, 27, 29, 31, 33, 35, 37
+},
+NUM_SENSORS, TIMEOUT, EMITTER_PIN);
+unsigned int sensorValues[NUM_SENSORS];
+
+//*********************************************************************//
+
+
+
+/////////////////////////////////////////////////////////////////////////////ARM
+Servo microServo;
+Servo bigServo;
+//*********************************************************************//
+
+
+
+
+////////////////////////////////////////////////////////////////////////////Encoders
+#define EncoderLPinA 18//20
+#define EncoderLPinB 16//19
+#define EncoderRPinA 19
+#define EncoderRPinB 17
+long countL = 0;
+long countR = 0;
+//*********************************************************************//
+
+
+
+
+//////////////////////////////////////extras
+int x = 1;
+int turn = 0;
+int pos = 0;
+int disLimit = 29;
+int disLimitF = 15;
+//*********************************************************************//
+
+
+
+
+
+
+////////////////////////////////////////////////////////////////////////MAP
+int arena[7][7] = {0};
+int initialDiri [7][7] = {0};
+int initialDirj [7][7] = {0};
+int dirBot[2];
+int deadEnd[10][2];
+int deadFound=0;
+int nextJunction=0;
+
+int i = 0;
+int j = 0;
+//********************************************************************
+
+
+
+
+void stopIfFault()
+{
+  if (md.getM1Fault())
+  {
+    Serial3.println("M1 fault");
+    while (1);
+  }
+  if (md.getM2Fault())
+  {
+    Serial3.println("M2 fault");
+    while (1);
+  }
+}
+
+
+
+
+void setup()
+{
+  Serial3.begin(19200);
+  //pinMode( 15, INPUT_PULLUP );
+  Serial3.println("Dual VNH5019 Motor Shield");
+  md.init();
+
+
+
+  //ir
+  pinMode (IRL, INPUT);
+  pinMode (IRR, INPUT);
+  pinMode (IRF, INPUT);
+  pinMode (IRDigi, INPUT);
+
+
+  //indicatorLeds
+  pinMode (blackLed, OUTPUT);
+  pinMode (whiteLed, OUTPUT);
+  pinMode (optionalLed, OUTPUT);
+
+  pinMode(15, INPUT_PULLUP);
+
+  //encoders
+  countL = 0;
+  countR = 0;
+  pinMode(EncoderLPinA, INPUT);
+  pinMode(EncoderLPinB, INPUT);
+  pinMode(EncoderRPinA, INPUT);
+  pinMode(EncoderRPinB, INPUT);
+  digitalWrite(EncoderLPinA, LOW);
+  digitalWrite(EncoderLPinB, LOW);
+  digitalWrite(EncoderRPinA, LOW);
+  digitalWrite(EncoderRPinB, LOW);
+  attachInterrupt(digitalPinToInterrupt(EncoderLPinA), readEncoderL, CHANGE);
+  attachInterrupt(digitalPinToInterrupt(EncoderRPinA), readEncoderR, CHANGE);
+
+
+  //arm
+  microServo.attach(45);
+  bigServo.attach(44);
+
+
+  ////  sensorArray
+  //  delay(500);
+  //  digitalWrite(optionalLed, HIGH);    // turn on Arduino's LED to indicate we are in calibration mode
+  //  for (int i = 0; i < 400; i++)  // make the calibration take about 10 seconds
+  //  {
+  //    qtrrc.calibrate();       // reads all sensors 10 times at 2500 us per read (i.e. ~25 ms per call)
+  //  }
+  //  digitalWrite(optionalLed, LOW);     // turn off Arduino's LED to indicate we are through with calibration
+  //
+  //  // print the calibration minimum values measured when emitters were on
+  //  Serial3.begin(9600);
+  //  for (int i = 0; i < NUM_SENSORS; i++)
+  //  {
+  //    Serial3.print(qtrrc.calibratedMinimumOn[i]);
+  //    Serial3.print(' ');
+  //  }
+  //  Serial3.println();
+  //
+  //  // print the calibration maximum values measured when emitters were on
+  //  for (int i = 0; i < NUM_SENSORS; i++)
+  //  {
+  //    Serial3.print(qtrrc.calibratedMaximumOn[i]);
+  //    Serial3.print(' ');
+  //  }
+  //  Serial3.println();
+  //  delay(500);
+
+
+
+
+
+
+
+
+  //direction
+  dirBot[0] = 0;
+  dirBot[1] = 1;
+
+  delay(1000);
+}
+
+
+
+
+void loop()
+{
+
+  //
+  //      Serial3.print(error);
+  //      Serial3.print("\t");
+  //      Serial3.print(disL);
+  //      Serial3.print("\t");
+  //      Serial3.print(disR);
+  //      Serial3.print("\t");
+  //      Serial3.print(disF);
+  //      Serial3.print("\t");
+  //      Serial3.print(digiOut);
+  //      Serial3.print("\t");
+  //      Serial3.print(sensorSum);
+  //      Serial3.print("\t");
+  //      Serial3.print(speed);
+  //      Serial3.print("\t");
+  //      Serial3.print(countL);
+  //      Serial3.print("\t");
+  //      Serial3.print(countR);
+  //      Serial3.println("    ");
+  printArena();
+  Serial3.println();
+  Serial3.println();
+  Serial3.println();
+
+
+  //    colorDetect();
+  //   sensorArray();
+  //  checkWalls();
+
+  //
+  //delay(100);
+  //
+
+  //
+  //    sensorUpdate();
+  //    pid();
+  //
+  //    md.setSpeeds(180-speed,180+speed);
+
+
+
+  //md.setSpeeds(250,250);
+
+  //if(disF<52){
+  //  forward();
+  //
+  //}
+
+  //  if(disF<10){
+  //    md.setBrakes(400,400);
+  //    delay(500000);
+  //  }
+
+
+  //for(int i=0;i<5;i++){
+  //  countL=0;
+  //  countR=0;
+  //  while((countR+countL)<3020){
+  //    sensorUpdate();
+  //    Pid();
+  //    md.setSpeeds(210-speed,200+speed);
+  //
+  //  }
+  //  md.setBrakes(400,400);
+  //  delay(5000);
+  //}
+
+  //   while(x==1){
+  //    turnRight(200);
+  //    x=0;
+  //
+  //   }
+
+  if (i == 6 && j == 3) {
+    digitalWrite(optionalLed, HIGH);
+    delay(5000);
+  }
+  sensorUpdate();
+
+  checkWalls();
+
+
+}
+
+
+
+
+
+
+
+
+void updatePosition() {
+  i = i + dirBot[0];
+  j = j + dirBot[1];
+}
+
+
+void turnTo(int k, int c) {
+  //  if (dirBot[0] == initialDiri[k][c] && dirBot[1] == initialDirj[k][c]) {
+  //    delay(10);
+  //  }
+  //  else {
+  //    turnRight(250);
+  //    if (dirBot[0] == initialDiri[k][c] && dirBot[1] == initialDirj[k][c]) {
+  //      delay(10);
+  //    }
+  //    else {
+  //      turnRight(250);
+  //      if (dirBot[0] == initialDiri[k][c] && dirBot[1] == initialDirj[k][c]) {
+  //        delay(10);
+  //      }
+  //      else {
+  //        turnRight(250);
+  //        if (dirBot[0] == initialDiri[k][c] && dirBot[1] == initialDirj[k][c]) {
+  //          delay(10);
+  //        }
+  //      }
+  //    }
+  //  }
+
+
+  for (int l = 0; l < 3; l++) {
+    if (dirBot[0] == initialDiri[k][c] && dirBot[1] == initialDirj[k][c]) {
+      break;
+    }
+    turnRight(250);
+
+  }
+}
+
+
+
+void checkWalls() {
+  int temp1 = dirBot[0];
+  int temp2 = dirBot[1];
+
+  if ((disL < disLimit && disR > disLimit  && disF > disLimitF)) {
+    //    if (arena[i][j] == 1) {
+    //      turnTo(i, j);
+    //    }
+    //    else {
+    //      initialDiri[i][j] = dirBot[0];
+    //      initialDirj[i][j] = dirBot[1];
+    //    }
+    if ((arena[i + dirBot[0]][j + dirBot[1]] == 0)) {
+      arena[i][j] = 1;
+      forward();
+    }
+    else {
+      updateDir(1);
+      if (arena[i + dirBot[0]][j + dirBot[1]] == 0) {
+        dirBot[0] = temp1;
+        dirBot[1] = temp2;
+        arena[i][j] = 1;
+        turnRight(250);
+        forward();
+      }
+      else {
+        dirBot[0] = temp1;
+        dirBot[1] = temp2;
+        digitalWrite(optionalLed, HIGH);
+        delay(1000);
+        digitalWrite(optionalLed, LOW);
+        forward();
+      }
+    }
+
+
+    //     |
+  }
+  else if (disL > disLimit  && disR > disLimit  && disF < disLimitF ) {
+    //
+    //    if (arena[i][j] == 1) {
+    //      turnTo(i, j);
+    //    }
+    //    else {
+    //      initialDiri[i][j] = dirBot[0];
+    //      initialDirj[i][j] = dirBot[1];
+    //    }
+    updateDir(0);
+    if (arena[i + dirBot[0]][j + dirBot[1]] == 0) {
+      dirBot[0] = temp1;
+      dirBot[1] = temp2;
+      arena[i][j] = 1;
+      turnLeft(250);
+      forward();
+    }
+    else {
+      dirBot[0] = temp1;
+      dirBot[1] = temp2;
+      updateDir(1);
+      if (arena[i + dirBot[0]][j + dirBot[1]] == 0) {
+        dirBot[0] = temp1;
+        dirBot[1] = temp2;
+        arena[i][j] = 1;
+        turnRight(250);
+        forward();
+      }
+      else {
+        dirBot[0] = temp1;
+        dirBot[1] = temp2;
+        digitalWrite(optionalLed, HIGH);
+        delay(1000);
+        digitalWrite(optionalLed, LOW);
+        turnLeft(250);
+        forward();
+      }
+    }
+    //      _
+    //
+  }
+  else if (disL > disLimit  && disR < disLimit  && disF > disLimitF ) { //wall at right
+
+    //    if (arena[i][j] == 1) {
+    //      turnTo(i, j);
+    //    }
+    //    else {
+    //      initialDiri[i][j] = dirBot[0];
+    //      initialDirj[i][j] = dirBot[1];
+    //    }
+    updateDir(0);
+    if (arena[i + dirBot[0]][j + dirBot[1]] == 0 || true) {
+      dirBot[0] = temp1;
+      dirBot[1] = temp2;
+      arena[i][j] = 1;
+      turnLeft(250);
+      forward();
+    }
+    else {
+      dirBot[0] = temp1;
+      dirBot[1] = temp2;
+      if (arena[i + dirBot[0]][j + dirBot[1]] == 0) {
+        arena[i][j] = 1;
+        forward();
+      }
+      else {
+        digitalWrite(optionalLed, HIGH);
+        delay(1000);
+        digitalWrite(optionalLed, LOW);
+        turnLeft(250);
+        forward();
+      }
+    }
+
+
+
+    //            |
+  }
+
+
+  //***********************************************************************************************************
+  else if (disL < disLimit  && disR > disLimit  && disF < disLimitF ) {
+
+
+
+    arena[i][j] = 1;
+    turnRight(250);
+    forward();
+    //     _
+    //    |
+
+
+  }
+  else if (disL < disLimit  && disR < disLimit  && disF > disLimitF ) {
+    arena[i][j] = 1;
+    forward();
+
+
+    //    |   |
+  }
+  else if (disL > disLimit  && disR < disLimit  && disF < disLimitF ) {
+    arena[i][j] = 1;
+    //    digitalWrite(optionalLed,HIGH);
+    //    delay(2000);
+    turnLeft(250);
+    forward();
+    
+    //digitalWrite(optionalLed,HIGH);
+    //     _
+    //      |
+
+
+  }
+
+  //****************************************************************************************************************
+  else if (disL < disLimit  && disR < disLimit  && disF < disLimitF ) {
+    deadFound=1;
+    nextJunction = 0;
+    arena[i][j] = 1;
+    turnRight(250);
+    turnRight(250);
+//turnAbout(250);
+forward();
+    //   _
+    //  | |
+  }
+  else {
+    arena[i][j] = 1;
+    turnLeft(250);
+  }
+
+
+
+  updatePosition();
+
+
+}
+
+void turnLeft(int rspeed) { /// turn1
+  countL = 0;
+  countR = 0;
+  while (countR < 480) {
+    md.setM1Speed(-rspeed);
+    md.setM2Speed(rspeed);
+  }
+  md.setBrakes(400, 400);
+  updateDir(0);
+  delay(200);
+  countL = 0;
+  countR = 0;
+
+
+
+
+}
+
+
+void turnRight(int rspeed) {
+  countL = 0;
+  countR = 0;
+  while (countL < 480) {
+    md.setM1Speed(rspeed);
+    md.setM2Speed(-rspeed);
+  }
+  md.setBrakes(400, 400);
+  updateDir(1);
+  delay(200);
+  countL = 0;
+  countR = 0;
+
+
+}
+
+void turnAbout(int rspeed) {
+  countL = 0;
+  countR = 0;
+  while (countL < (2 * 480)) {
+    md.setM1Speed(rspeed);
+    md.setM2Speed(-rspeed);
+  }
+  md.setBrakes(400, 400);
+  updateDir(2);
+  delay(200);
+  countL = 0;
+  countR = 0;
+
+
+}
+
+
+void forward() {
+
+  countL = 0;
+  countR = 0;
+
+  while ((countR + countL) < 2900) {
+    sensorUpdate();
+    pid();
+    pidEncoder();
+    md.setSpeeds(210 - speed - speedEncoder, 200 + speed + speedEncoder);
+    //md.setSpeeds(250-speedEncoder,250+speedEncoder);
+    if (disF < 10) {
+      break;
+    }
+  }
+
+  md.setBrakes(400,400);
+  delay(1000);
+  countL = 0;
+  countR = 0;
+
+}
+
+
+void sensorUpdate() {
+  disL = sharpl.distance();
+  disR = sharpr.distance();
+  disF = sharpf.distance();
+  //digiOut=digitalRead(IRDigi);
+}
+
+
+
+
+void sensorArray() {
+  sensorSum = 0;
+  qtrrc.readLine(sensorValues);
+  for (unsigned char i = 0; i < NUM_SENSORS; i++) {
+    sensorSum += sensorValues[i];
+  }
+  if (sensorSum < 200) {
+    digitalWrite(optionalLed, HIGH);
+  }
+  else {
+    digitalWrite(optionalLed, LOW);
+  }
+}
+
+
+void pid() {
+  if (disL > 20) {
+    error = (10 - disR);
+
+    speed = constrain((error * 5 + 100 * (error - last_errorR) ), -200, 200);
+
+    last_errorR = error;
+  }
+  else if (disR > 20) {
+
+    error = (disL - 10);
+    speed = constrain((error * 8 + 125 * (error - last_errorL) ), -200, 200);
+
+    last_errorL = error;
+  }
+
+
+  else {
+    error = disL - disR;
+    pTerm = Kp * (error);
+    integrated_error += error;
+    iTerm = Ki * constrain(integrated_error, -GUARD_GAIN, GUARD_GAIN);
+    dTerm = Kd * (error - last_error);
+    last_error = error;
+    speed = constrain(K * (pTerm + dTerm + iTerm), -200, 200);
+  }
+
+
+
+  if (disR > 20 && disL > 20) {
+    speed = 0;
+  }
+
+
+}
+
+
+
+
+void pidEncoder() {
+  errorEncoder = (countL - countR);
+  speedEncoder = constrain(0.3 * errorEncoder + 0.5 * (errorEncoder - last_errorEncoder) , -10, 10);
+  last_errorEncoder = errorEncoder;
+}
+
+
+void grip() {
+  bigServo.write(90);
+  delay(1000);
+  microServo.write(120);
+  delay(1000);
+  bigServo.write(180);
+  delay(1000);
+  microServo.write(180);
+  delay(1000);
+  bigServo.write(0);
+  delay(1000);
+  microServo.write(120);
+  delay(1000);
+  bigServo.write(90);
+  delay(5000);
+
+  //microServo.write(120);
+  //delay(1000);
+  //bigServo.write(0);
+  //delay(1000);
+  //microServo.write(180);
+  //delay(1000);
+  //bigServo.write(120);
+  //delay(1000);
+  //microServo.write(120);
+  //delay(1000);
+  //bigServo.write(90);
+  //delay(1000);
+
+
+}
+
+void colorDetect() {
+
+  if (digiOut == 0 && disF < 10) {
+    digitalWrite(whiteLed, HIGH);
+    digitalWrite(blackLed, LOW);
+    object = 1;
+  }
+  else if (digiOut == 1 && disF < 10) {
+    digitalWrite(blackLed, HIGH);
+    digitalWrite(whiteLed, LOW);
+    object = 1;
+  }
+  else {
+    digitalWrite(blackLed, LOW);
+    digitalWrite(whiteLed, LOW);
+    object = 0;
+  }
+}
+
+
+void readEncoderL()
+{
+  if (digitalRead(EncoderLPinB) == digitalRead(EncoderLPinA) )
+  {
+    countL = countL + 1; //may need to redefine positive and negative directions
+  }
+  else
+  {
+    countL = countL - 1;
+  }
+}
+
+void readEncoderR()
+{
+  if (digitalRead(EncoderRPinB) == digitalRead(EncoderRPinA) )
+  {
+    countR = countR - 1; //may need to redefine positive and negative directions
+  }
+  else
+  {
+    countR = countR + 1;
+  }
+
+}
+
+
+
+
+void printArena() {
+  int i = 0;
+  int j = 0;
+  for (i = 0; i < 7; i++) {
+    for (j = 0; j < 7; j++) {
+      Serial3.print(arena[i][j]);
+      Serial3.print("\t");
+
+    }
+    Serial3.println();
+  }
+}
+
+
+
+void updateDir(int side) {
+  //side = 0 - Left
+  //side = 1 - Right
+  //side = 2 - About
+  if (dirBot[0] == 0 && dirBot[1] == 1) {
+    if (side == 0) {
+      dirBot[0] = -1;
+      dirBot[1] = 0;
+    }
+    else if (side == 1) {
+      dirBot[0] = 1;
+      dirBot[1] = 0;
+    }
+    else {
+      dirBot[0] = 0;
+      dirBot[1] = -1;
+    }
+  }
+  else if (dirBot[0] == 1 && dirBot[1] == 0) {
+    if (side == 0) {
+      dirBot[0] = 0;
+      dirBot[1] = 1;
+    }
+    else if (side == 1) {
+      dirBot[0] = 0;
+      dirBot[1] = -1;
+    }
+    else {
+      dirBot[0] = -1;
+      dirBot[1] = 0;
+    }
+  }
+  else if (dirBot[0] == 0 && dirBot[1] == -1) {
+    if (side == 0) {
+      dirBot[0] = 1;
+      dirBot[1] = 0;
+    }
+    else if (side == 1) {
+      dirBot[0] = -1;
+      dirBot[1] = 0;
+    }
+    else {
+      dirBot[0] = 0;
+      dirBot[1] = 1;
+    }
+  }
+  else if (dirBot[0] == -1 && dirBot[1] == 0) {
+    if (side == 0) {
+      dirBot[0] = 0;
+      dirBot[1] = -1;
+    }
+    else if (side == 1) {
+      dirBot[0] = 0;
+      dirBot[1] = 1;
+    }
+    else {
+      dirBot[0] = 1;
+      dirBot[1] = 0;
+    }
+  }
+}
